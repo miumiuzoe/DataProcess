@@ -6,6 +6,7 @@ import re
 import shutil
 import sys
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -65,7 +66,7 @@ class AssociateTestRunner:
 
         testcase_path = feature_dir / "testcase.ini"
         testdata_dir = feature_dir / "testdata"
-        expectations = self.load_test_expectations(testcase_path, testdata_dir)
+        expectations = self.load_test_expectations(testcase_path)
         guid_to_position = self.query_guid_positions(feature_name, testcase_path, expectations)
         rule_input_dir = Path(self.query_rule_input_dir())
         output_dir = Path(self.query_output_dir())
@@ -78,27 +79,22 @@ class AssociateTestRunner:
         results = self.verify_nb_file(nb_file, expectations, guid_to_position)
         self.write_test_results(feature_dir / "test_result.txt", results)
 
-    def load_test_expectations(self, testcase_path: Path, testdata_dir: Path) -> List[TestExpectation]:
-        """解析 testcase.ini，并将各 section 绑定到 bcp 中提取的 casename。"""
+    def load_test_expectations(self, testcase_path: Path) -> List[TestExpectation]:
+        """解析 testcase.ini，并读取每个 section 中显式配置的 casename。"""
         parser = configparser.ConfigParser()
         parser.optionxform = str
         ini_content = testcase_path.read_text(encoding="utf-8")
         parser.read_string("[DEFAULT]\n" + ini_content, source=str(testcase_path))
 
-        case_names = self.extract_case_names(testdata_dir)
         if not parser.sections():
             raise ConfigurationError("{} 中未找到任何测试用例".format(testcase_path))
 
         expectations: List[TestExpectation] = []
-        for index, section in enumerate(parser.sections()):
+        for section in parser.sections():
             section_items = dict(parser.items(section))
             case_name = section_items.pop("casename", "").strip()
             if not case_name:
-                if index >= len(case_names):
-                    raise ConfigurationError(
-                        "{} 缺少 casename，且 testdata 中没有足够的【用例标题】按顺序匹配".format(section)
-                    )
-                case_name = case_names[index]
+                raise ConfigurationError("{} 的 [{}] 缺少 casename 配置".format(testcase_path, section))
             expected_by_guid: Dict[str, str] = {}
             for key, value in section_items.items():
                 match = self.EXPECTED_KEY_PATTERN.match(key.strip())
@@ -109,14 +105,6 @@ class AssociateTestRunner:
                 expected_by_guid[match.group("guid").strip()] = value.strip()
             expectations.append(TestExpectation(case_id=section, case_name=case_name, expected_by_guid=expected_by_guid))
         return expectations
-
-    def extract_case_names(self, testdata_dir: Path) -> List[str]:
-        """提取 testdata 下所有 bcp 文件中【】包裹的用例标题。"""
-        case_names: List[str] = []
-        for bcp_file in sorted(testdata_dir.glob("*.bcp")):
-            content = bcp_file.read_text(encoding="utf-8")
-            case_names.extend([match.strip() for match in self.CASE_NAME_PATTERN.findall(content)])
-        return case_names
 
     def query_guid_positions(
         self,
@@ -147,8 +135,7 @@ class AssociateTestRunner:
             expected_guids.update(expectation.expected_by_guid.keys())
 
         guid_to_position: Dict[str, int] = {}
-        for dst_row in dst_fields:
-            field_guid = str(dst_row[0]).strip()
+        for field_guid in self.extract_dst_field_guids(dst_fields):
             if not field_guid:
                 continue
             rows = self.db_client.fetch_all(dst_field_id_sql, {"dst_field": field_guid})
@@ -173,6 +160,46 @@ class AssociateTestRunner:
             elif second_value in expected_guid_set and first_value.isdigit():
                 guid_to_position[second_value] = int(first_value)
         return guid_to_position
+
+    def extract_dst_field_guids(self, dst_fields: Sequence[Tuple]) -> List[str]:
+        """从 dst_field 查询结果中提取所有非空 RULE guid。"""
+        guid_list: List[str] = []
+        for dst_row in dst_fields:
+            if not dst_row:
+                continue
+            guid_list.extend(self.extract_rule_guids_from_text(str(dst_row[0]).strip()))
+        return guid_list
+
+    def extract_rule_guids_from_text(self, content: str) -> List[str]:
+        """从 XML 或 XML 片段文本中提取所有非空 RULE guid。"""
+        if not content:
+            return []
+
+        xml_text = "<ROOT>{}</ROOT>".format(content)
+        try:
+            root = ET.fromstring(xml_text)
+            guid_list = []
+            for rule_node in root.iter():
+                if rule_node.tag.upper() != "RULE":
+                    continue
+                guid = (rule_node.attrib.get("guid") or "").strip()
+                if guid:
+                    guid_list.append(guid)
+            if guid_list:
+                return guid_list
+        except ET.ParseError:
+            pass
+
+        # 兼容数据库返回的不完整 XML 片段或混合文本内容。
+        guid_list = []
+        for match in re.finditer(r"<RULE\b[^>]*\bguid=['\"]([^'\"]*)['\"]", content, flags=re.IGNORECASE):
+            guid = match.group(1).strip()
+            if guid:
+                guid_list.append(guid)
+        if guid_list:
+            return guid_list
+
+        raise ConfigurationError("dst_field 返回值不是有效的 XML 内容，无法解析 RULE guid: {}".format(content))
 
     def query_rule_input_dir(self) -> str:
         """查询并返回 bcp 测试文件输入目录。"""
@@ -280,7 +307,11 @@ class AssociateTestRunner:
     ) -> List[Tuple[str, str]]:
         """将 nb 文件实际值与期望值比较，并返回每条用例的校验结果。"""
         records = self.load_nb_records(nb_file)
-        record_by_case_name = {record[0]: record for record in records if record}
+        record_by_case_name = {}
+        for record in records:
+            case_name = self.extract_case_name_from_nb_record(record)
+            if case_name:
+                record_by_case_name[case_name] = record
         results: List[Tuple[str, str]] = []
 
         for expectation in expectations:
@@ -303,12 +334,20 @@ class AssociateTestRunner:
         return results
 
     def load_nb_records(self, nb_file: Path) -> List[List[str]]:
-        """读取以 tab 分隔的 nb 文件，并转换为记录列表。"""
+        """读取 nb 文件，并按真实 tab 拆分字段且保留空列。"""
         records: List[List[str]] = []
         for raw_line in nb_file.read_text(encoding="utf-8", errors="ignore").splitlines():
             if raw_line.strip():
                 records.append(raw_line.rstrip("\n").split("\t"))
         return records
+
+    def extract_case_name_from_nb_record(self, record: Sequence[str]) -> str:
+        """从一条 nb 记录中提取【】包裹的用例标题。"""
+        for field_value in record:
+            match = self.CASE_NAME_PATTERN.search(field_value)
+            if match:
+                return match.group(1).strip()
+        return ""
 
     def write_test_results(self, output_path: Path, results: Sequence[Tuple[str, str]]) -> None:
         """将最终测试结果写入 test_result.txt。"""
